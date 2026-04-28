@@ -393,7 +393,8 @@ impl<P: BackingView> View for PaneView<P> {
         // Add the underlying pane view.
         column.add_child(Shrinkable::new(1., ChildView::new(&active_child).finish()).finish());
 
-        let mut container = Container::new(column.finish());
+        let mut container = Container::new(column.finish())
+            .with_corner_radius(crate::workspace::island_frame::pane_container_corner_radius());
         if pane_configuration.show_accent_border {
             let border = Border::all(2.).with_border_fill(appearance.theme().accent());
             container = container.with_border(border);

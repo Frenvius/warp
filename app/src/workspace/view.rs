@@ -17445,8 +17445,8 @@ impl Workspace {
         .with_height(TAB_BAR_HEIGHT)
         .finish();
 
-        let tab_bar_border =
-            Border::bottom(TAB_BAR_BORDER_HEIGHT).with_border_fill(appearance.theme().outline());
+        let tab_bar_border = Border::bottom(crate::workspace::island_frame::TAB_BAR_BOTTOM_BORDER_HEIGHT)
+            .with_border_fill(appearance.theme().outline());
 
         let mut tab_bar_container = Container::new(
             EventHandler::new(Clipped::new(self.render_tab_bar_hoverable(bar_contents)).finish())
@@ -21886,9 +21886,10 @@ impl View for Workspace {
             }
             let content = self.render_banner_and_active_tab(app, appearance);
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
+            let panels_row = crate::workspace::island_frame::wrap_panels(panels_row, app);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
             Container::new(outer_column.finish())
-                .with_background(util::get_terminal_background_fill(self.window_id, app))
+                .with_background(crate::workspace::island_frame::outer_chrome_fill(app))
                 .finish()
         };
         let mut stack = Stack::new();
