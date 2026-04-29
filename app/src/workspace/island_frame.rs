@@ -1,9 +1,6 @@
-//! Fork-only "island" framing for the workspace content area.
-//!
-//! Adds a chrome margin around the panels area so the tab bar / window
-//! header reads as a frame around the rounded panes inside. Lives in its
-//! own module so upstream merges only touch a couple of small call sites
-//! in `workspace/view.rs` and `pane_group/pane/view/mod.rs`.
+//! "Island" framing for the workspace content area: chrome margin around the
+//! panels so the tab bar / window header reads as a frame around the rounded
+//! panes inside.
 
 use warpui::elements::{Border, Container, CornerRadius, Element, Fill, Radius};
 use warpui::{AppContext, SingletonEntity as _};
@@ -24,17 +21,17 @@ pub const SPLIT_DIVIDER_THICKNESS: f32 = ISLAND_OUTER_MARGIN;
 /// flows seamlessly into the island chrome.
 pub const TAB_BAR_BOTTOM_BORDER_HEIGHT: f32 = 0.0;
 
-/// Corner radius applied to the pane `Container` upstream so the rectangular
+/// Corner radius applied to the pane `Container` so the rectangular
 /// `inactive_pane_overlay` (painted via `with_foreground_overlay`) follows
-/// the same rounded path as the pane content. Without this the overlay
-/// leaks past the pane's rounded edge into the surrounding chrome and shows
-/// up as a "pointed tip" at the corners of inactive panes.
+/// the same rounded path as the pane content. Without this the overlay leaks
+/// past the pane's rounded edge and shows up as a "pointed tip" at the
+/// corners of inactive panes.
 pub fn pane_container_corner_radius() -> CornerRadius {
     CornerRadius::with_all(Radius::Pixels(ISLAND_CORNER_RADIUS))
 }
 
 /// Wraps the panels area in a chrome margin. Uses a `Border` (instead of
-/// padding + parent background) so the chrome is painted only on the 3px strip
+/// padding + parent background) so the chrome is painted only on the strip
 /// around the panels, never bleeding through transparent pane content.
 pub fn wrap_panels(panels: Box<dyn Element>, app: &AppContext) -> Box<dyn Element> {
     let theme = Appearance::as_ref(app).theme();

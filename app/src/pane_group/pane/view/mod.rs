@@ -404,6 +404,8 @@ impl<P: BackingView> View for PaneView<P> {
         let should_dim_inactive_panes = *PaneSettings::as_ref(app).should_dim_inactive_panes;
         let dim_even_if_focused = pane_configuration.dim_even_if_focused();
         if should_dim_inactive_panes {
+            container =
+                container.with_foreground_overlay(appearance.theme().inactive_pane_overlay());
             if dim_even_if_focused {
                 // Focus is in a side panel: dim this pane regardless of split state or focus.
                 container =
