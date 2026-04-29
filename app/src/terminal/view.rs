@@ -3580,8 +3580,9 @@ impl TerminalView {
 
         let claude_prompt_overlay: ViewHandle<crate::cli_agent_prompt::ClaudePromptOverlay> = {
             let weak_self: WeakViewHandle<Self> = ctx.handle();
-            ctx.add_view(|c| {
-                crate::cli_agent_prompt::ClaudePromptOverlay::new(weak_self, c)
+            let me_handle = model_events_handle.clone();
+            ctx.add_typed_action_view(|c| {
+                crate::cli_agent_prompt::ClaudePromptOverlay::new(weak_self, me_handle, c)
             })
         };
         ctx.subscribe_to_view(&claude_prompt_overlay, |me, _, event, ctx| match event {
@@ -3589,6 +3590,9 @@ impl TerminalView {
                 let mut bytes = text.clone().into_bytes();
                 bytes.push(b'\r');
                 me.write_to_pty(Cow::<'static, [u8]>::Owned(bytes), ctx);
+            }
+            crate::cli_agent_prompt::ClaudePromptOverlayEvent::WriteRaw { bytes } => {
+                me.write_to_pty(Cow::<'static, [u8]>::Owned(bytes.clone()), ctx);
             }
         });
 
@@ -25429,7 +25433,10 @@ impl TypedActionView for TerminalView {
                 });
             }
             OpenCLIAgentRichInput => {
-                if self.has_active_cli_agent_input_session(ctx) {
+                if crate::cli_agent_prompt::is_claude_code_active(self.view_id, ctx) {
+                    self.claude_prompt_overlay
+                        .update(ctx, |overlay, c| overlay.toggle_hidden(c));
+                } else if self.has_active_cli_agent_input_session(ctx) {
                     self.close_cli_agent_rich_input_and_disable_auto_toggle(ctx);
                 } else {
                     self.open_cli_agent_rich_input(CLIAgentInputEntrypoint::CtrlG, ctx);
@@ -25534,7 +25541,9 @@ impl View for TerminalView {
                         column.add_child(ChildView::new(&self.use_agent_footer).finish());
                     }
 
-                    if self.is_input_box_visible(&model, app) {
+                    if self.is_input_box_visible(&model, app)
+                        && !crate::cli_agent_prompt::is_claude_code_active(self.view_id, app)
+                    {
                         column.add_child(self.render_input());
                     } else if !model.is_read_only()
                         && is_cloud_agent_pre_first_exchange(
