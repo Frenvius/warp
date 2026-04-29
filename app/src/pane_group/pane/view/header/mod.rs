@@ -970,27 +970,7 @@ impl<P: BackingView> TypedActionView for PaneHeader<P> {
     }
 }
 
-/// Adds the active pane indicator to the stack.
-fn add_active_pane_indicator_to_stack(stack: &mut Stack, appearance: &Appearance) {
-    let indicator = Icon::new(
-        "bundled/svg/upper-left-triangle.svg",
-        appearance.theme().accent(),
-    )
-    .finish();
-    let child = ConstrainedBox::new(indicator)
-        .with_height(16.)
-        .with_width(16.)
-        .finish();
-    stack.add_positioned_child(
-        child,
-        OffsetPositioning::offset_from_parent(
-            vec2f(0., 0.),
-            ParentOffsetBounds::ParentBySize,
-            ParentAnchor::TopLeft,
-            ChildAnchor::TopLeft,
-        ),
-    );
-}
+fn add_active_pane_indicator_to_stack(_stack: &mut Stack, _appearance: &Appearance) {}
 
 pub fn toolbelt_button_position_id(
     pane_configuration: &ModelHandle<PaneConfiguration>,

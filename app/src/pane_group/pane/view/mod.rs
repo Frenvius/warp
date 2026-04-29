@@ -395,10 +395,11 @@ impl<P: BackingView> View for PaneView<P> {
 
         let mut container = Container::new(column.finish())
             .with_corner_radius(crate::workspace::island_frame::pane_container_corner_radius());
-        if pane_configuration.show_accent_border {
-            let border = Border::all(2.).with_border_fill(appearance.theme().accent());
-            container = container.with_border(border);
+        let mut border = Border::all(2.);
+        if pane_configuration.show_accent_border || pane_configuration.show_active_pane_indicator {
+            border = border.with_border_fill(appearance.theme().accent());
         }
+        container = container.with_border(border);
 
         // Dim inactive panes.
         let should_dim_inactive_panes = *PaneSettings::as_ref(app).should_dim_inactive_panes;
