@@ -31,11 +31,7 @@ pub(in crate::pane_group) const DEFAULT_FLEX_VALUE: f32 = 1.0;
 pub(in crate::pane_group) const DEFAULT_FLEX_SIZE: PaneFlex = PaneFlex(DEFAULT_FLEX_VALUE);
 
 pub fn get_divider_thickness() -> f32 {
-    if FeatureFlag::MinimalistUI.is_enabled() {
-        1.0
-    } else {
-        2.0
-    }
+    crate::workspace::island_frame::SPLIT_DIVIDER_THICKNESS
 }
 
 // Extra padding for the divider to make it easier to resize.
@@ -1359,7 +1355,7 @@ fn create_divider(
 ) -> Box<dyn Element> {
     let divider = ConstrainedBox::new(
         Rect::new()
-            .with_background(theme.split_pane_border_color())
+            .with_background(crate::workspace::island_frame::split_divider_fill(theme))
             .finish(),
     );
 
@@ -1397,7 +1393,7 @@ fn create_minimalist_divider(
 ) -> Box<dyn Element> {
     let divider = ConstrainedBox::new(
         Rect::new()
-            .with_background(theme.split_pane_border_color())
+            .with_background(crate::workspace::island_frame::split_divider_fill(theme))
             .finish(),
     );
 

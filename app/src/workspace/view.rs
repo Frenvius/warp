@@ -18714,7 +18714,7 @@ impl Workspace {
             Shrinkable::new(1.0, terminal_view).finish()
         } else {
             let main_content = Container::new(terminal_view)
-                .with_background(util::get_terminal_background_fill(self.window_id, app))
+                .with_background(crate::workspace::island_frame::outer_chrome_fill(app))
                 .with_corner_radius(*PANEL_CORNER_RADIUS)
                 .finish();
 

@@ -5,13 +5,20 @@
 //! own module so upstream merges only touch a couple of small call sites
 //! in `workspace/view.rs` and `pane_group/pane/view/mod.rs`.
 
-use warpui::elements::{Container, CornerRadius, Element, Fill, Radius};
+use warpui::elements::{Border, Container, CornerRadius, Element, Fill, Radius};
 use warpui::{AppContext, SingletonEntity as _};
+
+use warp_core::ui::theme::color::internal_colors;
 
 use crate::appearance::Appearance;
 
 const ISLAND_OUTER_MARGIN: f32 = 3.0;
 const ISLAND_CORNER_RADIUS: f32 = 8.0;
+
+/// Thickness of the chrome strip rendered between split panes. Matches
+/// [`ISLAND_OUTER_MARGIN`] so the gap between two panes reads as a
+/// continuation of the chrome margin around the panel area.
+pub const SPLIT_DIVIDER_THICKNESS: f32 = ISLAND_OUTER_MARGIN;
 
 /// Bottom-border thickness applied below the tab bar. Zeroed so the tab bar
 /// flows seamlessly into the island chrome.
@@ -26,20 +33,33 @@ pub fn pane_container_corner_radius() -> CornerRadius {
     CornerRadius::with_all(Radius::Pixels(ISLAND_CORNER_RADIUS))
 }
 
-/// Wraps the panels area in a chrome margin. The rounded look of each pane
-/// comes from `pane_container_corner_radius` upstream, so this wrap only
-/// needs to provide breathing room around the group.
-pub fn wrap_panels(panels: Box<dyn Element>, _app: &AppContext) -> Box<dyn Element> {
+/// Wraps the panels area in a chrome margin. Uses a `Border` (instead of
+/// padding + parent background) so the chrome is painted only on the 3px strip
+/// around the panels, never bleeding through transparent pane content.
+pub fn wrap_panels(panels: Box<dyn Element>, app: &AppContext) -> Box<dyn Element> {
+    let theme = Appearance::as_ref(app).theme();
     Container::new(panels)
-        .with_padding_left(ISLAND_OUTER_MARGIN)
-        .with_padding_right(ISLAND_OUTER_MARGIN)
-        .with_padding_bottom(ISLAND_OUTER_MARGIN)
+        .with_border(
+            Border::new(ISLAND_OUTER_MARGIN)
+                .with_sides(false, true, true, true)
+                .with_border_fill(internal_colors::fg_overlay_1(theme)),
+        )
         .finish()
 }
 
-/// Background fill for the chrome that surrounds the island. Uses a more
-/// standout surface tint than the pane background so the frame reads as a
-/// clear extension of the tab bar / window header.
+/// Background fill for the chrome that surrounds the island. Same fill the
+/// tab bar uses (`fg_overlay_1` — 5% foreground tint) so the chrome reads
+/// as one continuous surface with the tab bar / window header instead of
+/// being a different shade beside it.
 pub fn outer_chrome_fill(app: &AppContext) -> Fill {
-    Appearance::as_ref(app).theme().surface_2().into()
+    internal_colors::fg_overlay_1(Appearance::as_ref(app).theme()).into()
+}
+
+/// Fill used for the divider strip between split panes. Returns `Fill::None`
+/// so the divider's resize hit-target stays in the layout while remaining
+/// visually transparent — the chrome painted by `outer_chrome_fill` on the
+/// surrounding Container shows through, giving a single uniform gap surface
+/// without stacked alpha at 4-way intersections.
+pub fn split_divider_fill(_theme: &warp_core::ui::theme::WarpTheme) -> Fill {
+    Fill::None
 }
