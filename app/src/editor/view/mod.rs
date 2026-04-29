@@ -600,7 +600,10 @@ pub fn init(ctx: &mut AppContext) {
         )
         .with_custom_action(CustomAction::AddNextOccurrence)
         .with_context_predicate(
-            id!("EditorView") & !id!("IMEOpen") & !id!(flags::CLI_AGENT_RICH_INPUT_OPEN),
+            id!("EditorView")
+                & !id!("IMEOpen")
+                & !id!(flags::CLI_AGENT_RICH_INPUT_OPEN)
+                & !id!("ClaudePromptOverlayEditor"),
         ),
         // `shift-end` is registered on all platforms for this action.
         EditableBinding::new(
@@ -4700,7 +4703,8 @@ impl EditorView {
     fn shift_tab(&mut self, ctx: &mut ViewContext<Self>) {
         if self.can_edit(ctx) {
             match self.propagate_vertical_navigation_keys {
-                PropagateAndNoOpNavigationKeys::Always => {
+                PropagateAndNoOpNavigationKeys::Always
+                | PropagateAndNoOpNavigationKeys::AtBoundary => {
                     ctx.emit(Event::Navigate(NavigationKey::ShiftTab))
                 }
                 _ => self.unindent(ctx),

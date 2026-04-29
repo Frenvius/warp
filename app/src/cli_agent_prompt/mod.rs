@@ -19,14 +19,22 @@ pub mod status_parser;
 pub fn init(app: &mut warpui::AppContext) {
     use warpui::keymap::macros::*;
     use warpui::keymap::FixedBinding;
-    // Ctrl-G is intentionally not registered here; warp already binds it
-    // at the parent `Terminal` scope (see `terminal/view::OpenCLIAgentRichInput`)
-    // and we hijack that handler from the overlay to toggle visibility.
-    app.register_fixed_bindings([FixedBinding::new(
-        "shift-tab",
-        ClaudePromptOverlayAction::CycleMode,
-        id!(ClaudePromptOverlay::ui_name()),
-    )]);
+    app.register_fixed_bindings([
+        FixedBinding::new(
+            "shift-tab",
+            ClaudePromptOverlayAction::CycleMode,
+            id!(ClaudePromptOverlay::ui_name()),
+        ),
+        // Editor doesn't consume ctrl-g in non-Integration channels, but
+        // the parent `Terminal` scope binding only fires when focus is on
+        // the terminal grid, not on our floating editor. Bind it directly
+        // on the overlay so toggle works regardless of where focus sits.
+        FixedBinding::new(
+            "ctrl-g",
+            ClaudePromptOverlayAction::ToggleHide,
+            id!(ClaudePromptOverlay::ui_name()),
+        ),
+    ]);
 }
 
 use std::time::Duration;
@@ -77,6 +85,11 @@ const PROMPT_PADDING_V: f32 = 6.;
 const OVERLAY_OUTER_MARGIN_X: f32 = 4.;
 const OVERLAY_OUTER_MARGIN_Y: f32 = 5.;
 const LOGO_SIZE: f32 = 16.;
+/// Identifier injected into our editor's keymap context. Upstream's
+/// `add_next_occurrence` binding (in `editor/view/mod.rs`) excludes this
+/// flag so ctrl-g bubbles up to our `ToggleHide` binding instead of
+/// getting consumed by the editor.
+const EDITOR_KEYMAP_FLAG: &str = "ClaudePromptOverlayEditor";
 
 /// Per-pane floating overlay hosting an `EditorView` whose submitted text is
 /// piped to the terminal's PTY. One instance per `TerminalView`.
@@ -220,6 +233,13 @@ impl ClaudePromptOverlay {
                     PropagateAndNoOpNavigationKeys::AtBoundary,
                 autogrow: true,
                 soft_wrap: true,
+                // Tags this editor's keymap context with a sentinel that
+                // upstream's `add_next_occurrence` binding excludes — without
+                // it, ctrl-g hits AddNextOccurrence inside this editor before
+                // bubbling to our `ToggleHide` binding on the overlay scope.
+                keymap_context_modifier: Some(Box::new(|context, _| {
+                    context.set.insert(EDITOR_KEYMAP_FLAG);
+                })),
                 ..Default::default()
             };
             let mut editor = EditorView::new(options, ctx);
