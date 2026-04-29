@@ -12,7 +12,7 @@ use warp_core::ui::theme::color::internal_colors;
 
 use crate::appearance::Appearance;
 
-const ISLAND_OUTER_MARGIN: f32 = 3.0;
+const ISLAND_OUTER_MARGIN: f32 = 5.0;
 const ISLAND_CORNER_RADIUS: f32 = 8.0;
 
 /// Thickness of the chrome strip rendered between split panes. Matches
