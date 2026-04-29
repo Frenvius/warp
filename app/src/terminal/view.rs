@@ -2392,6 +2392,10 @@ pub struct TerminalView {
     /// The input area at the bottom of the viewport.
     input: ViewHandle<Input>,
 
+    /// Floating Claude Code prompt overlay (fork). Always constructed, only
+    /// rendered when a Claude Code CLI agent session is active in this pane.
+    claude_prompt_overlay: ViewHandle<crate::cli_agent_prompt::ClaudePromptOverlay>,
+
     inline_menu_positioner: ModelHandle<InlineMenuPositioner>,
 
     /// Colors used for rendering.
@@ -3574,6 +3578,20 @@ impl TerminalView {
             )
         });
 
+        let claude_prompt_overlay: ViewHandle<crate::cli_agent_prompt::ClaudePromptOverlay> = {
+            let weak_self: WeakViewHandle<Self> = ctx.handle();
+            ctx.add_view(|c| {
+                crate::cli_agent_prompt::ClaudePromptOverlay::new(weak_self, c)
+            })
+        };
+        ctx.subscribe_to_view(&claude_prompt_overlay, |me, _, event, ctx| match event {
+            crate::cli_agent_prompt::ClaudePromptOverlayEvent::Submit { text } => {
+                let mut bytes = text.clone().into_bytes();
+                bytes.push(b'\r');
+                me.write_to_pty(Cow::<'static, [u8]>::Owned(bytes), ctx);
+            }
+        });
+
         let inline_menu_positioner = input.as_ref(ctx).inline_terminal_menu_positioner().clone();
         ctx.subscribe_to_model(&inline_menu_positioner, |_, _, _, ctx| {
             ctx.notify();
@@ -4016,6 +4034,7 @@ impl TerminalView {
         let mut terminal_view = Self {
             model,
             input,
+            claude_prompt_overlay,
             inline_menu_positioner,
             view_handle: ctx.handle(),
             size_info: size_info.into(),
@@ -25542,6 +25561,13 @@ impl View for TerminalView {
                 }
             }
         };
+
+        crate::cli_agent_prompt::add_overlay_to_stack(
+            &mut stack,
+            self.view_id,
+            &self.claude_prompt_overlay,
+            app,
+        );
 
         if self.is_any_tooltip_open() {
             self.render_grid_tooltip(&mut stack, &model, appearance, app);
