@@ -82,8 +82,8 @@ const PROMPT_HINT: &str = "Enter ↵ send · Shift+Enter newline";
 const PROMPT_BORDER_RADIUS: f32 = 8.;
 const PROMPT_PADDING_H: f32 = 10.;
 const PROMPT_PADDING_V: f32 = 6.;
-const OVERLAY_OUTER_MARGIN_X: f32 = 4.;
-const OVERLAY_OUTER_MARGIN_Y: f32 = 5.;
+const OVERLAY_OUTER_MARGIN_X: f32 = 2.;
+const OVERLAY_OUTER_MARGIN_Y: f32 = 2.;
 const LOGO_SIZE: f32 = 16.;
 /// Identifier injected into our editor's keymap context. Upstream's
 /// `add_next_occurrence` binding (in `editor/view/mod.rs`) excludes this
