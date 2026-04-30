@@ -394,19 +394,24 @@ impl<P: BackingView> View for PaneView<P> {
         column.add_child(Shrinkable::new(1., ChildView::new(&active_child).finish()).finish());
 
         let mut container = Container::new(column.finish())
-            .with_corner_radius(crate::workspace::island_frame::pane_container_corner_radius());
+            .with_corner_radius(crate::workspace::island_frame::pane_container_corner_radius())
+            // Paint the theme base background on every pane so panes read
+            // as a darker surface beneath the brighter `outer_chrome_fill`
+            // of the surrounding gap and frame.
+            .with_background(appearance.theme().background());
         let mut border = Border::all(2.);
         if pane_configuration.show_accent_border || pane_configuration.show_active_pane_indicator {
             border = border.with_border_fill(appearance.theme().accent());
         }
         container = container.with_border(border);
 
-        // Dim inactive panes.
+        // Honor the "dim inactive panes" setting: when enabled, layer the
+        // `inactive_pane_overlay` on top of the pane background. With the
+        // setting off, every pane shows its full base color regardless of
+        // focus / split state.
         let should_dim_inactive_panes = *PaneSettings::as_ref(app).should_dim_inactive_panes;
         let dim_even_if_focused = pane_configuration.dim_even_if_focused();
         if should_dim_inactive_panes {
-            container =
-                container.with_foreground_overlay(appearance.theme().inactive_pane_overlay());
             if dim_even_if_focused {
                 // Focus is in a side panel: dim this pane regardless of split state or focus.
                 container =

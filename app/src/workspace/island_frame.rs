@@ -30,33 +30,36 @@ pub fn pane_container_corner_radius() -> CornerRadius {
     CornerRadius::with_all(Radius::Pixels(ISLAND_CORNER_RADIUS))
 }
 
-/// Wraps the panels area in a chrome margin. Uses a `Border` (instead of
-/// padding + parent background) so the chrome is painted only on the strip
-/// around the panels, never bleeding through transparent pane content.
+/// Wraps the panels area in a chrome margin. The Border only reserves
+/// the margin geometry — both the border and the wrapper's background
+/// stay transparent so the parent workspace Container's
+/// `outer_chrome_fill` shows through unchanged. That guarantees the
+/// frame strip, the inter-pane gaps, and the tab bar all paint from the
+/// exact same surface (including any window-focus dimming applied
+/// upstream of this wrapper).
 pub fn wrap_panels(panels: Box<dyn Element>, app: &AppContext) -> Box<dyn Element> {
-    let theme = Appearance::as_ref(app).theme();
+    let _ = app;
     Container::new(panels)
         .with_border(
             Border::new(ISLAND_OUTER_MARGIN)
                 .with_sides(false, true, true, true)
-                .with_border_fill(internal_colors::fg_overlay_1(theme)),
+                .with_border_fill(Fill::None),
         )
         .finish()
 }
 
-/// Background fill for the chrome that surrounds the island. Same fill the
-/// tab bar uses (`fg_overlay_1` — 5% foreground tint) so the chrome reads
-/// as one continuous surface with the tab bar / window header instead of
-/// being a different shade beside it.
+/// Single source of truth for the chrome color: the tab bar / window
+/// header, the frame margin around the panels, and the inter-pane gaps
+/// all read from this. Anything that needs to render an "outside the
+/// pane" surface should call this so there's no chance of drift.
 pub fn outer_chrome_fill(app: &AppContext) -> Fill {
     internal_colors::fg_overlay_1(Appearance::as_ref(app).theme()).into()
 }
 
-/// Fill used for the divider strip between split panes. Returns `Fill::None`
-/// so the divider's resize hit-target stays in the layout while remaining
-/// visually transparent — the chrome painted by `outer_chrome_fill` on the
-/// surrounding Container shows through, giving a single uniform gap surface
-/// without stacked alpha at 4-way intersections.
+/// Fill used for the divider strip between split panes. Always
+/// transparent — the resize handle must not paint over its hit-target.
+/// The gap surface is supplied by `outer_chrome_fill` on a parent
+/// Container; the divider just reserves the layout slot.
 pub fn split_divider_fill(_theme: &warp_core::ui::theme::WarpTheme) -> Fill {
     Fill::None
 }

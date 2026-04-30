@@ -56,13 +56,17 @@ use warpui::{
     ViewContext, ViewHandle, WeakViewHandle,
 };
 
+use crate::settings::ai::AISettings;
 use crate::appearance::Appearance;
 use crate::editor::{
     EditOrigin, EditorOptions, EditorView, Event as EditorEvent, PropagateAndNoOpNavigationKeys,
     TextOptions,
 };
 use warp_editor::editor::NavigationKey;
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus,
+    CLIAgentSessionsModel,
+};
 use crate::terminal::model_events::ModelEventDispatcher;
 use crate::terminal::view::TerminalView;
 use crate::terminal::CLIAgent;
@@ -356,9 +360,61 @@ impl ClaudePromptOverlay {
                     ctx.notify();
                 }
                 me.try_init_history(ctx);
+                me.maybe_register_claude_from_alt_screen(ctx);
                 me.start_render_poll(ctx);
             },
         );
+    }
+
+    /// Fallback Claude detection: when the warp plugin doesn't register a
+    /// session (e.g. PS1 input mode bypasses the warp shell bootstrap),
+    /// no `CLIAgentSession` is created via plugin sentinels or block-list
+    /// command detection. The overlay then never shows because
+    /// `is_claude_code_active` returns false. Detect Claude directly from
+    /// its alt-screen footer (`[Model (context)]`) and synthesize a
+    /// listener-less session ourselves so the overlay surfaces regardless
+    /// of warp's input plumbing.
+    fn maybe_register_claude_from_alt_screen(&self, ctx: &mut ViewContext<Self>) {
+        let Some(terminal_view) = self.terminal_view.upgrade(ctx) else {
+            return;
+        };
+        let view_id = terminal_view.as_ref(ctx).id();
+
+        if CLIAgentSessionsModel::as_ref(ctx).session(view_id).is_some() {
+            return;
+        }
+
+        let parsed = self.read_parsed_status(ctx);
+        if parsed.model.is_none() {
+            return;
+        }
+
+        let should_auto_toggle_input =
+            *AISettings::as_ref(ctx).auto_open_rich_input_on_cli_agent_start;
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
+            // Re-check inside the closure to avoid a TOCTOU race against
+            // a concurrent plugin SessionStart that registered between
+            // the read above and this update.
+            if sessions_model.session(view_id).is_some() {
+                return;
+            }
+            sessions_model.set_session(
+                view_id,
+                CLIAgentSession {
+                    agent: CLIAgent::Claude,
+                    status: CLIAgentSessionStatus::InProgress,
+                    session_context: CLIAgentSessionContext::default(),
+                    input_state: CLIAgentInputState::Closed,
+                    should_auto_toggle_input,
+                    listener: None,
+                    plugin_version: None,
+                    remote_host: None,
+                    draft_text: None,
+                    custom_command_prefix: None,
+                },
+                ctx,
+            );
+        });
     }
 
     fn read_alt_screen_hash(&self, app: &AppContext) -> u64 {
