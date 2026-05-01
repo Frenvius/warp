@@ -3621,6 +3621,9 @@ impl TerminalView {
             crate::cli_agent_prompt::ClaudePromptOverlayEvent::WriteRaw { bytes } => {
                 me.write_to_pty(Cow::<'static, [u8]>::Owned(bytes.clone()), ctx);
             }
+            crate::cli_agent_prompt::ClaudePromptOverlayEvent::FocusTerminal => {
+                me.focus_terminal(ctx);
+            }
         });
 
         let inline_menu_positioner = input.as_ref(ctx).inline_terminal_menu_positioner().clone();
@@ -7517,6 +7520,18 @@ impl TerminalView {
     /// Receiving the warpui::Event::KeyDown event from a child element.
     /// Generally, this should be control characters rather than printable characters.
     fn keydown_on_terminal(&mut self, characters: &str, ctx: &mut ViewContext<Self>) {
+        // Fork: Tab while the terminal grid is focused and Claude is active
+        // moves focus to the floating prompt overlay instead of forwarding
+        // the byte to the PTY. Mirrors waveterm's "Tab toggles between TUI
+        // and prompt input" affordance. We can't do this with a keybinding
+        // because typed-action dispatch walks the focused view's ancestors
+        // and the overlay is a child of `TerminalView`, never in that chain.
+        if characters == "\t"
+            && crate::cli_agent_prompt::is_claude_code_active(self.view_id, ctx)
+        {
+            ctx.focus(&self.claude_prompt_overlay);
+            return;
+        }
         if self.is_long_running() {
             self.on_ssh_warpification_key_event(Some(SshKeyEvent::from_chars(characters)), ctx);
             self.highlighted_link.invalidate();

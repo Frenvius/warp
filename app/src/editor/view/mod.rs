@@ -4638,7 +4638,8 @@ impl EditorView {
     fn tab(&mut self, ctx: &mut ViewContext<Self>) {
         if self.can_edit(ctx) {
             match self.propagate_vertical_navigation_keys {
-                PropagateAndNoOpNavigationKeys::Always => {
+                PropagateAndNoOpNavigationKeys::Always
+                | PropagateAndNoOpNavigationKeys::AtBoundary => {
                     ctx.emit(Event::Navigate(NavigationKey::Tab))
                 }
                 _ => self.handle_tab(ctx),

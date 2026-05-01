@@ -35,11 +35,17 @@ pub fn init(app: &mut warpui::AppContext) {
             id!(ClaudePromptOverlay::ui_name()),
         ),
     ]);
+    // NOTE: Tab-from-terminal-back-to-overlay can't be done with a
+    // FixedBinding because typed-action dispatch walks the focused view's
+    // ancestors and the overlay is a *child* of the terminal — never in
+    // that chain. We intercept Tab inside `keydown_on_terminal` instead.
 }
 
 use std::time::Duration;
 
+use once_cell::sync::Lazy;
 use pathfinder_color::ColorU;
+use regex::Regex;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::{Fill as ThemeFill, WarpTheme};
 use warpui::r#async::Timer;
@@ -83,6 +89,19 @@ const PROMPT_FONT_SIZE: f32 = 13.;
 const HINT_FONT_SIZE: f32 = 11.;
 const PROMPT_PLACEHOLDER: &str = "Tell Claude what to do...";
 const PROMPT_HINT: &str = "Enter ↵ send · Shift+Enter newline";
+const PROMPT_HINT_POPOVER: &str = "Enter ↵ select & send · Tab complete · Esc close";
+const PROMPT_HINT_SUBMITTING: &str = "Submitting prompt...";
+/// Delay between the input pre-clear (Ctrl-C / Ctrl-U) and the actual prompt
+/// bytes. Without it Claude may receive the keystrokes too close together to
+/// reliably reset its input buffer before our text arrives.
+const SUBMIT_PRECLEAR_DELAY_MS: u64 = 80;
+
+/// Matches Claude's "Press Ctrl-C again to exit" footer, which appears for
+/// ~2s after the user sends an empty Ctrl-C. If we sent another Ctrl-C while
+/// this banner is up, Claude would interpret it as the confirming press and
+/// exit — so the send pipeline pre-clears with Ctrl-U (kill line) instead.
+static EXIT_BANNER_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)press ctrl-?c again").unwrap());
 const PROMPT_BORDER_RADIUS: f32 = 8.;
 const PROMPT_PADDING_H: f32 = 10.;
 const PROMPT_PADDING_V: f32 = 6.;
@@ -129,6 +148,12 @@ pub struct ClaudePromptOverlay {
     /// avoid re-walking the filesystem on every keystroke.
     commands: Vec<CommandEntry>,
     models: Vec<CommandEntry>,
+    /// Most recently submitted prompt. Esc on an empty draft restores it,
+    /// matching waveterm's "undo my interrupt" affordance.
+    last_sent: Option<String>,
+    /// True while a submission is mid-flight (between the pre-clear write
+    /// and the actual prompt write). Blocks double-Enter and swaps the hint.
+    is_submitting: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +233,9 @@ pub enum ClaudePromptOverlayAction {
     /// Hide the overlay; user can restore it by clicking the floating
     /// chevron pill that replaces it.
     ToggleHide,
+    /// Move keyboard focus to the editor. Dispatched from a click handler
+    /// on the prompt body so any click on padding lands focus on the input.
+    FocusEditor,
 }
 
 #[derive(Debug)]
@@ -218,6 +246,9 @@ pub enum ClaudePromptOverlayEvent {
     /// User clicked an icon that maps to a fixed escape sequence (interrupt,
     /// cycle mode). Parent writes the bytes verbatim.
     WriteRaw { bytes: Vec<u8> },
+    /// User pressed Tab in the editor with no popover open. Parent moves
+    /// keyboard focus from the overlay back to the terminal grid.
+    FocusTerminal,
 }
 
 impl ClaudePromptOverlay {
@@ -262,6 +293,8 @@ impl ClaudePromptOverlay {
             EditorEvent::Escape => {
                 if me.popover.take().is_some() {
                     ctx.notify();
+                } else {
+                    me.handle_escape(ctx);
                 }
             }
             EditorEvent::Navigate(NavigationKey::ShiftTab) => {
@@ -272,6 +305,8 @@ impl ClaudePromptOverlay {
             EditorEvent::Navigate(NavigationKey::Tab) => {
                 if me.popover.is_some() {
                     me.popover_complete(ctx);
+                } else {
+                    ctx.emit(ClaudePromptOverlayEvent::FocusTerminal);
                 }
             }
             EditorEvent::Navigate(NavigationKey::Up) => {
@@ -317,6 +352,8 @@ impl ClaudePromptOverlay {
             history_loaded: false,
             commands: all_commands(),
             models: builtin_models(),
+            last_sent: None,
+            is_submitting: false,
         };
         me.try_init_history(ctx);
         me.start_render_poll(ctx);
@@ -488,6 +525,9 @@ impl ClaudePromptOverlay {
     }
 
     fn handle_send(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.is_submitting {
+            return;
+        }
         let text = self.editor.update(ctx, |editor, ctx| {
             let buf = editor.buffer_text(ctx);
             editor.clear_buffer_and_reset_undo_stack(ctx);
@@ -497,8 +537,76 @@ impl ClaudePromptOverlay {
             return;
         }
         self.push_history(text.clone());
+        self.last_sent = Some(text.clone());
         self.history_state = HistoryState::LiveDraft;
-        ctx.emit(ClaudePromptOverlayEvent::Submit { text });
+
+        // Pre-clear Claude's input so any text the user typed directly into
+        // the TUI gets wiped before our prompt arrives. Ctrl-C is the
+        // reliable wipe except when Claude is already showing its
+        // "Press Ctrl-C again to exit" banner — a second Ctrl-C there would
+        // kill Claude. In that case fall back to Ctrl-U (kill line),
+        // which both wipes the input and dismisses the banner safely.
+        let banner = self.detect_exit_banner(ctx);
+        let clear_byte: u8 = if banner { 0x15 } else { 0x03 };
+        ctx.emit(ClaudePromptOverlayEvent::WriteRaw {
+            bytes: vec![clear_byte],
+        });
+
+        self.is_submitting = true;
+        ctx.notify();
+
+        ctx.spawn(
+            async move { Timer::after(Duration::from_millis(SUBMIT_PRECLEAR_DELAY_MS)).await },
+            move |me, _, ctx| {
+                ctx.emit(ClaudePromptOverlayEvent::Submit { text });
+                me.is_submitting = false;
+                ctx.notify();
+            },
+        );
+    }
+
+    /// Esc when no popover is open: send Ctrl-C to interrupt whatever Claude
+    /// is doing, and if the editor is empty restore the most recently sent
+    /// prompt. Mirrors waveterm's "I changed my mind" affordance.
+    fn handle_escape(&mut self, ctx: &mut ViewContext<Self>) {
+        ctx.emit(ClaudePromptOverlayEvent::WriteRaw { bytes: vec![0x03] });
+        let cur = self.editor.as_ref(ctx).buffer_text(ctx);
+        if !cur.trim().is_empty() {
+            return;
+        }
+        let Some(prev) = self.last_sent.clone() else {
+            return;
+        };
+        self.history_state = HistoryState::LiveDraft;
+        self.editor.update(ctx, |e, ctx| {
+            // SystemEdit so the Edited handler doesn't reset history state
+            // a second time and so this restoration doesn't get pushed onto
+            // any undo stack as a user action.
+            e.system_reset_buffer_text(prev.as_str(), ctx);
+            e.move_to_buffer_end(ctx);
+        });
+    }
+
+    /// True when Claude's footer is currently showing the "Press Ctrl-C
+    /// again to exit" banner. Read off the alt-screen text — same source
+    /// as the status parser, so no extra plumbing.
+    fn detect_exit_banner(&self, app: &AppContext) -> bool {
+        let Some(terminal_view) = self.terminal_view.upgrade(app) else {
+            return false;
+        };
+        let model = terminal_view.as_ref(app).model.lock();
+        if !model.is_alt_screen_active() {
+            return false;
+        }
+        let text = model.alt_screen().output_to_string();
+        // The banner sits at the very bottom of Claude's TUI; only scan the
+        // tail to keep the regex cheap on large alt-screens.
+        let tail = if text.len() > 1500 {
+            &text[text.len() - 1500..]
+        } else {
+            text.as_str()
+        };
+        EXIT_BANNER_RE.is_match(tail)
     }
 
     fn push_history(&mut self, text: String) {
@@ -996,8 +1104,15 @@ impl View for ClaudePromptOverlay {
             .with_child(Shrinkable::new(1., editor_el).finish())
             .finish();
 
+        let hint_text = if self.is_submitting {
+            PROMPT_HINT_SUBMITTING
+        } else if self.popover.is_some() {
+            PROMPT_HINT_POPOVER
+        } else {
+            PROMPT_HINT
+        };
         let hint = FormattedTextElement::from_str(
-            PROMPT_HINT,
+            hint_text,
             appearance.ui_font_family(),
             HINT_FONT_SIZE,
         )
@@ -1033,15 +1148,25 @@ impl View for ClaudePromptOverlay {
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(PROMPT_BORDER_RADIUS)))
             .finish();
 
+        // Click anywhere on the prompt body — including padding outside the
+        // editor — focuses the editor. `Continue` so a click that lands on
+        // the editor itself still reaches it normally for caret placement.
+        let prompt_clickable = EventHandler::new(prompt_container)
+            .on_left_mouse_down(|ctx, _, _| {
+                ctx.dispatch_typed_action(ClaudePromptOverlayAction::FocusEditor);
+                DispatchEventResult::PropagateToParent
+            })
+            .finish();
+
         let Some(popover) = self.popover.as_ref() else {
-            return prompt_container;
+            return prompt_clickable;
         };
         let popover_el = self.render_popover(appearance, popover);
         Flex::column()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(Container::new(popover_el).with_margin_bottom(4.).finish())
-            .with_child(prompt_container)
+            .with_child(prompt_clickable)
             .finish()
     }
 }
@@ -1063,6 +1188,9 @@ impl TypedActionView for ClaudePromptOverlay {
             ClaudePromptOverlayAction::ToggleHide => {
                 self.is_hidden = !self.is_hidden;
                 ctx.notify();
+            }
+            ClaudePromptOverlayAction::FocusEditor => {
+                ctx.focus(&self.editor);
             }
         }
     }
