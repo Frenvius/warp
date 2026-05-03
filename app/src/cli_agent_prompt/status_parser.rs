@@ -15,6 +15,13 @@ pub struct ParsedStatus {
     pub shells: Option<u32>,
     pub remote: bool,
     pub focused: bool,
+    /// True when the alt-screen contains Claude's input box
+    /// (`╭...╮` / `╰...╯` borders). When false the user is on a menu /
+    /// confirmation screen rather than the prompt.
+    pub has_input_box: bool,
+    /// True when the alt-screen looks like one of Claude's selection
+    /// screens: "resume session", model picker, "(N of M)" pagination, etc.
+    pub menu_mode: bool,
 }
 
 impl ParsedStatus {
@@ -26,6 +33,19 @@ impl ParsedStatus {
             && self.shells.is_none()
             && !self.remote
             && !self.focused
+    }
+
+    /// True when the overlay should auto-hide so it doesn't overlap
+    /// Claude's TUI. Mirrors waveterm's `questionMode` heuristic: either
+    /// a recognizable menu screen, OR no input box AND no status footer
+    /// (which signals a confirmation prompt taking over the whole TUI).
+    pub fn is_question_mode(&self) -> bool {
+        if self.menu_mode {
+            return true;
+        }
+        let has_status_marker = self.model.is_some();
+        let has_focus_marker = self.focused;
+        !self.has_input_box && !has_status_marker && !has_focus_marker
     }
 }
 
@@ -67,6 +87,16 @@ static SHELLS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d+)\s+shells?\b").un
 static REMOTE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)remote\s+control\s+active").unwrap());
 static FOCUS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bfocus\b").unwrap());
+/// Recognizes Claude's interactive selection screens (resume session, model
+/// picker, switch-to dialogs, etc.) and any pagination footer. These are
+/// the only TUI states where the prompt is replaced wholesale rather than
+/// just minimized to a footer.
+static MENU_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(resume session|select an?|switch to|choose)\b|\(\s*\d+\s+of\s+\d+\s*\)",
+    )
+    .unwrap()
+});
 
 pub fn parse_status(text: &str) -> ParsedStatus {
     if text.is_empty() {
@@ -127,6 +157,29 @@ pub fn parse_status(text: &str) -> ParsedStatus {
 
     result.remote = REMOTE_RE.is_match(text);
     result.focused = FOCUS_RE.is_match(text);
+
+    // Box detection: a complete prompt input frame has both a top border
+    // (containing `╭` and `╮`) and a bottom border (`╰` and `╯`) on
+    // separate lines. Selection screens render a search field with the
+    // same characters but no `[Model ...]` footer above it, so this flag
+    // alone isn't enough — see `is_question_mode()`.
+    let mut has_top_border = false;
+    let mut has_bottom_border = false;
+    for line in text.lines() {
+        if !has_top_border && line.contains('╭') && line.contains('╮') {
+            has_top_border = true;
+        }
+        if !has_bottom_border && line.contains('╰') && line.contains('╯') {
+            has_bottom_border = true;
+        }
+        if has_top_border && has_bottom_border {
+            break;
+        }
+    }
+    result.has_input_box = has_top_border && has_bottom_border;
+
+    result.menu_mode = MENU_RE.is_match(text);
+
     result
 }
 
@@ -160,5 +213,38 @@ mod tests {
     fn detects_remote_control() {
         assert!(parse_status("[Opus 4.7]  14%        Remote Control active").remote);
         assert!(!parse_status("[Opus 4.7]  14%").remote);
+    }
+
+    #[test]
+    fn detects_input_box_borders() {
+        let with_box = "\
+╭───────────╮
+│ > what's up │
+╰───────────╯
+[Opus 4.7]  0%";
+        let parsed = parse_status(with_box);
+        assert!(parsed.has_input_box);
+        assert!(!parsed.is_question_mode());
+
+        let without = "[Opus 4.7]  0%";
+        assert!(!parse_status(without).has_input_box);
+    }
+
+    #[test]
+    fn detects_menu_screens() {
+        let menu = "\
+Resume session?
+  - chat 1
+  - chat 2
+(2 of 2)";
+        let parsed = parse_status(menu);
+        assert!(parsed.menu_mode);
+        assert!(parsed.is_question_mode());
+    }
+
+    #[test]
+    fn empty_screen_is_question_mode() {
+        // No box, no model, no focus → looks like a confirmation prompt.
+        assert!(parse_status("Are you sure? (y/n)").is_question_mode());
     }
 }

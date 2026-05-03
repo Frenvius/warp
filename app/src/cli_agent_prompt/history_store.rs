@@ -19,6 +19,9 @@ const HISTORY_FILE_VERSION: u32 = 1;
 #[derive(Debug)]
 pub struct HistoryStore {
     path: PathBuf,
+    /// Sibling of `path` with `.draft` extension — holds the live
+    /// (typed-but-unsent) draft so it survives a restart.
+    draft_path: PathBuf,
     /// Soft cap. `append` writes one line; `trim_to` rewrites the file
     /// when it overshoots, so we don't grow without bound across long
     /// project lifetimes.
@@ -37,7 +40,12 @@ impl HistoryStore {
         workspace_key.hash(&mut hasher);
         let hash = hasher.finish();
         let path = base.join(format!("{hash:016x}.jsonl"));
-        Some(Self { path, max_entries })
+        let draft_path = base.join(format!("{hash:016x}.draft"));
+        Some(Self {
+            path,
+            draft_path,
+            max_entries,
+        })
     }
 
     pub fn load(&self) -> Vec<String> {
@@ -84,6 +92,35 @@ impl HistoryStore {
         }
         Ok(())
     }
+
+    /// Reads any persisted draft for this workspace. Returns `None` when
+    /// the draft file is missing, empty, or unreadable — the overlay then
+    /// just starts with a blank editor.
+    pub fn load_draft(&self) -> Option<String> {
+        let raw = fs::read_to_string(&self.draft_path).ok()?;
+        if raw.is_empty() {
+            return None;
+        }
+        Some(raw)
+    }
+
+    /// Writes the live draft. Called debounced (~500 ms) by the overlay so
+    /// we're not hitting the disk on every keystroke.
+    pub fn save_draft(&self, text: &str) -> std::io::Result<()> {
+        let mut file = File::create(&self.draft_path)?;
+        file.write_all(text.as_bytes())?;
+        Ok(())
+    }
+
+    /// Drops the draft file. Called after a successful submission so a
+    /// restart doesn't restore an already-sent prompt.
+    pub fn clear_draft(&self) -> std::io::Result<()> {
+        match fs::remove_file(&self.draft_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -95,7 +132,12 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let path = base.join("h.jsonl");
-        HistoryStore { path, max_entries: max }
+        let draft_path = base.join("h.draft");
+        HistoryStore {
+            path,
+            draft_path,
+            max_entries: max,
+        }
     }
 
     #[test]
@@ -122,5 +164,19 @@ mod tests {
         s.append("old").unwrap();
         s.rewrite(&["a".into(), "b".into()]).unwrap();
         assert_eq!(s.load(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn draft_round_trip_and_clear() {
+        let s = temp_store("draft", 10);
+        assert_eq!(s.load_draft(), None);
+        s.save_draft("hello world").unwrap();
+        assert_eq!(s.load_draft().as_deref(), Some("hello world"));
+        s.save_draft("updated").unwrap();
+        assert_eq!(s.load_draft().as_deref(), Some("updated"));
+        s.clear_draft().unwrap();
+        assert_eq!(s.load_draft(), None);
+        // Clearing when already absent is a no-op, not an error.
+        s.clear_draft().unwrap();
     }
 }

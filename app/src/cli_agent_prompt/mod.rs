@@ -154,6 +154,19 @@ pub struct ClaudePromptOverlay {
     /// True while a submission is mid-flight (between the pre-clear write
     /// and the actual prompt write). Blocks double-Enter and swaps the hint.
     is_submitting: bool,
+    /// True when the alt-screen looks like a Claude menu / question screen
+    /// (resume picker, model picker, "(N of M)" pagination, etc.) — the
+    /// overlay auto-hides so it doesn't draw on top of the TUI.
+    is_question_mode: bool,
+    /// Counter that increments on every editor edit. Each scheduled draft
+    /// save captures the value at schedule time and only writes if the
+    /// counter is still equal when the timer fires — a debounce that
+    /// doesn't require tracking the spawn handle.
+    draft_save_gen: u64,
+    /// True once a persisted draft has been restored (or determined absent)
+    /// for this session. Prevents the lazy init from clobbering an empty
+    /// editor on every poll tick after the first successful load.
+    draft_restored: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,17 +323,15 @@ impl ClaudePromptOverlay {
                 }
             }
             EditorEvent::Navigate(NavigationKey::Up) => {
-                if let Some(pop) = me.popover.as_mut() {
-                    pop.move_selection(-1);
-                    ctx.notify();
+                if me.popover.is_some() {
+                    me.popover_move(-1, ctx);
                 } else {
                     me.history_prev(ctx);
                 }
             }
             EditorEvent::Navigate(NavigationKey::Down) => {
-                if let Some(pop) = me.popover.as_mut() {
-                    pop.move_selection(1);
-                    ctx.notify();
+                if me.popover.is_some() {
+                    me.popover_move(1, ctx);
                 } else {
                     me.history_next(ctx);
                 }
@@ -328,6 +339,7 @@ impl ClaudePromptOverlay {
             EditorEvent::Edited(EditOrigin::UserTyped | EditOrigin::UserInitiated) => {
                 me.history_state = HistoryState::LiveDraft;
                 me.recompute_popover(ctx);
+                me.schedule_draft_save(ctx);
             }
             _ => {}
         });
@@ -354,6 +366,9 @@ impl ClaudePromptOverlay {
             models: builtin_models(),
             last_sent: None,
             is_submitting: false,
+            is_question_mode: false,
+            draft_save_gen: 0,
+            draft_restored: false,
         };
         me.try_init_history(ctx);
         me.start_render_poll(ctx);
@@ -381,6 +396,81 @@ impl ClaudePromptOverlay {
             self.history_store = Some(store);
         }
         self.history_loaded = true;
+        self.try_restore_draft(ctx);
+    }
+
+    /// Pulls any persisted draft text into the editor on first load. Only
+    /// runs once per overlay; subsequent edits / clears don't re-trigger.
+    fn try_restore_draft(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.draft_restored {
+            return;
+        }
+        self.draft_restored = true;
+        let Some(store) = self.history_store.as_ref() else {
+            return;
+        };
+        let Some(draft) = store.load_draft() else {
+            return;
+        };
+        if draft.is_empty() {
+            return;
+        }
+        // Only restore into an empty editor — if the user already started
+        // typing while we were resolving the workspace key, leave their
+        // current text alone.
+        let cur = self.editor.as_ref(ctx).buffer_text(ctx);
+        if !cur.is_empty() {
+            return;
+        }
+        self.editor.update(ctx, |e, ctx| {
+            e.system_reset_buffer_text(draft.as_str(), ctx);
+            e.move_to_buffer_end(ctx);
+        });
+    }
+
+    /// Schedules a draft save 500 ms in the future. Each call increments
+    /// `draft_save_gen`; the timer's callback only writes if the gen is
+    /// still equal — newer edits invalidate older scheduled saves without
+    /// us needing to track abort handles.
+    fn schedule_draft_save(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.history_store.is_none() {
+            return;
+        }
+        self.draft_save_gen = self.draft_save_gen.wrapping_add(1);
+        let gen = self.draft_save_gen;
+        ctx.spawn(
+            async move { Timer::after(Duration::from_millis(500)).await },
+            move |me, _, ctx| {
+                if me.draft_save_gen != gen {
+                    return;
+                }
+                me.persist_draft(ctx);
+            },
+        );
+    }
+
+    fn persist_draft(&self, ctx: &ViewContext<Self>) {
+        let Some(store) = self.history_store.as_ref() else {
+            return;
+        };
+        let text = self.editor.as_ref(ctx).buffer_text(ctx);
+        let res = if text.trim().is_empty() {
+            store.clear_draft()
+        } else {
+            store.save_draft(&text)
+        };
+        if let Err(err) = res {
+            log::warn!("claude prompt: draft persist failed: {err}");
+        }
+    }
+
+    fn clear_draft_now(&self) {
+        let Some(store) = self.history_store.as_ref() else {
+            return;
+        };
+        if let Err(err) = store.clear_draft() {
+            log::warn!("claude prompt: draft clear failed: {err}");
+        }
     }
 
     /// Polls the alt-screen contents every ~80ms and triggers a re-render
@@ -398,9 +488,30 @@ impl ClaudePromptOverlay {
                 }
                 me.try_init_history(ctx);
                 me.maybe_register_claude_from_alt_screen(ctx);
+                me.update_question_mode(ctx);
                 me.start_render_poll(ctx);
             },
         );
+    }
+
+    /// Recomputes `is_question_mode` from the parsed alt-screen footer.
+    /// Notifies the view only on transitions so the overlay flips visible
+    /// / hidden in step with Claude's TUI without churning extra paints.
+    fn update_question_mode(&mut self, ctx: &mut ViewContext<Self>) {
+        let parsed = self.read_parsed_status(ctx);
+        // While the alt-screen is inactive (e.g. shell is the foreground
+        // app, no Claude TUI yet) the parser returns an empty result. That
+        // would test as question_mode=true, causing the overlay to flicker
+        // off during inter-screen transitions. Gate the update on having
+        // some parsed signal so we only react to real Claude output.
+        if parsed.is_empty() && !parsed.has_input_box && !parsed.menu_mode {
+            return;
+        }
+        let next = parsed.is_question_mode();
+        if next != self.is_question_mode {
+            self.is_question_mode = next;
+            ctx.notify();
+        }
     }
 
     /// Fallback Claude detection: when the warp plugin doesn't register a
@@ -502,6 +613,34 @@ impl ClaudePromptOverlay {
         ctx.notify();
     }
 
+    /// Moves the popover selection by `delta` and, when the popover is the
+    /// model picker, live-syncs the editor buffer to `/model <selected>`
+    /// so the user previews exactly what they'd send. Slash-command popover
+    /// gets only the selection move — the editor still shows the user's
+    /// typed query so they can refine the filter.
+    fn popover_move(&mut self, delta: i32, ctx: &mut ViewContext<Self>) {
+        let Some(pop) = self.popover.as_mut() else {
+            return;
+        };
+        pop.move_selection(delta);
+        let preview = match pop.kind {
+            PopoverKind::Model => pop
+                .items
+                .get(pop.selected)
+                .map(|e| format!("/model {}", e.name)),
+            PopoverKind::Slash => None,
+        };
+        if let Some(preview) = preview {
+            self.editor.update(ctx, |e, ctx| {
+                // SystemEdit so the popover's recompute_popover hook
+                // doesn't re-fire and reset the selection on every arrow.
+                e.system_reset_buffer_text(preview.as_str(), ctx);
+                e.move_to_buffer_end(ctx);
+            });
+        }
+        ctx.notify();
+    }
+
     /// Inserts the popover's current selection into the editor buffer.
     /// `/model` is special-cased: it leaves the popover open in `Model`
     /// kind so the user can chain command + arg in one flow.
@@ -539,6 +678,7 @@ impl ClaudePromptOverlay {
         self.push_history(text.clone());
         self.last_sent = Some(text.clone());
         self.history_state = HistoryState::LiveDraft;
+        self.clear_draft_now();
 
         // Pre-clear Claude's input so any text the user typed directly into
         // the TUI gets wiped before our prompt arrives. Ctrl-C is the
@@ -1085,6 +1225,15 @@ impl View for ClaudePromptOverlay {
         let bg_fill = theme.surface_1();
         let border_color = internal_colors::neutral_3(theme);
         let hint_color = internal_colors::text_sub(theme, bg_fill.into_solid());
+
+        // Auto-hide while Claude is on a menu/question screen so the
+        // overlay doesn't draw over its own TUI. Returns the empty
+        // element rather than the manual-hide pill — the pill is a
+        // user-driven affordance, this is automatic and reverses itself
+        // as soon as the menu closes.
+        if self.is_question_mode {
+            return Empty::new().finish();
+        }
 
         if self.is_hidden {
             return Self::render_hidden_pill(theme, bg_fill, border_color);
