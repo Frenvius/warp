@@ -113,8 +113,16 @@ use crate::util::openable_file_type::FileTarget;
 #[cfg(feature = "local_fs")]
 use crate::util::openable_file_type::{resolve_file_target_with_editor_choice, EditorLayout};
 
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+use crate::ai::blocklist::agent_view::agent_input_footer::sort_environments_by_recency;
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+use crate::ai::blocklist::handoff::touched_repos::{
+    derive_touched_workspace, extract_paths_from_conversation, pick_handoff_overlap_env,
+};
 use crate::ai::blocklist::history_model::CloudConversationData;
 use crate::ai::blocklist::FORK_PREFIX;
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+use crate::ai::cloud_environments::CloudAmbientAgentEnvironment;
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::{plugin_manager_for, PluginModalKind};
 use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSessionsModelEvent};
@@ -313,6 +321,8 @@ use crate::terminal::session_settings::{
 };
 use crate::terminal::settings::{SpacingMode, TerminalSettings};
 use crate::terminal::shell::ShellType;
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+use crate::terminal::view::ambient_agent::{HandoffSubmissionState, PendingHandoff};
 #[cfg(feature = "local_tty")]
 use crate::terminal::view::docker_sandbox::DEFAULT_DOCKER_SANDBOX_BASE_IMAGE;
 use crate::terminal::{self, SizeInfo, TerminalView};
@@ -2933,7 +2943,7 @@ impl Workspace {
                 // Update transcript details if task or conversation data is updated
                 AgentConversationsModelEvent::NewTasksReceived
                 | AgentConversationsModelEvent::TasksUpdated
-                | AgentConversationsModelEvent::ConversationUpdated
+                | AgentConversationsModelEvent::ConversationUpdated { .. }
                 | AgentConversationsModelEvent::ConversationArtifactsUpdated { .. } => {
                     me.update_transcript_details_panel_data(ctx);
                 }
@@ -5621,18 +5631,27 @@ impl Workspace {
             #[allow(unused_variables)]
             AIFactViewEvent::OpenFile(path) => {
                 #[cfg(feature = "local_fs")]
-                self.open_code(
-                    CodeSource::Link {
-                        path: path.clone(),
-                        range_start: None,
-                        range_end: None,
-                    },
-                    *EditorSettings::as_ref(ctx).open_file_layout.value(),
-                    None,  // no line/column specified
-                    false, // preview
-                    &[],
-                    ctx,
-                );
+                {
+                    let settings = EditorSettings::as_ref(ctx);
+                    let target = resolve_file_target_with_editor_choice(
+                        path,
+                        *settings.open_file_editor,
+                        *settings.prefer_markdown_viewer,
+                        *settings.open_file_layout,
+                        None,
+                    );
+                    self.open_file_with_target(
+                        path.clone(),
+                        target,
+                        None,
+                        CodeSource::Link {
+                            path: path.clone(),
+                            range_start: None,
+                            range_end: None,
+                        },
+                        ctx,
+                    );
+                }
             }
             AIFactViewEvent::InitializeProject(path) => {
                 let active_terminal_view = self
@@ -7979,10 +7998,6 @@ impl Workspace {
         context: Option<&CodeReviewPaneContext>,
         ctx: &mut ViewContext<Self>,
     ) {
-        if !*TabSettings::as_ref(ctx).show_code_review_button {
-            return;
-        }
-
         // If context is provided, use it directly. Otherwise, derive from active pane group.
         let context_data: Option<(
             Option<PathBuf>,
@@ -12852,6 +12867,136 @@ impl Workspace {
         });
     }
 
+    /// Open a local-to-cloud handoff pane next to the active local pane. Triggered
+    /// by the `/move-to-cloud` slash command and the "Hand off to cloud" footer
+    /// chip.
+    ///
+    /// Resolves the active conversation up front. If there's an eligible source
+    /// conversation (active, non-empty, has a `server_conversation_token`), splits a
+    /// fresh cloud-mode pane to the right and seeds it with handoff context so the
+    /// submit path routes through the orchestrator. Otherwise, still splits a fresh
+    /// cloud-mode pane (no handoff context) so the chip is always-clickable per the
+    /// existing posture — there's nothing meaningful to hand off in that state, but
+    /// the user clearly wanted a cloud-mode pane.
+    #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+    fn start_local_to_cloud_handoff(
+        &mut self,
+        initial_prompt: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !FeatureFlag::OzHandoff.is_enabled() || !FeatureFlag::HandoffLocalCloud.is_enabled() {
+            return;
+        }
+
+        // Resolve the source conversation (if any). The current active session view's
+        // active conversation drives the fork pointer and the touched-repo derivation.
+        let source = self
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .active_session_view(ctx)
+            .and_then(|view| {
+                let terminal_view_id = view.id();
+                let history = BlocklistAIHistoryModel::handle(ctx);
+                history
+                    .as_ref(ctx)
+                    .active_conversation(terminal_view_id)
+                    .filter(|c| !c.is_empty())
+                    .and_then(|conversation| {
+                        conversation
+                            .server_conversation_token()
+                            .cloned()
+                            .map(|token| (conversation.clone(), token))
+                    })
+            });
+
+        // Split a fresh cloud-mode pane to the right of the active pane. Mirrors
+        // `Workspace::open_network_log_pane`'s pattern but uses `add_ambient_agent_pane`
+        // so the new pane is wired up as a cloud-mode terminal (with the right pre-
+        // session shared-session viewer manager).
+        self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
+            pane_group.add_ambient_agent_pane(ctx);
+        });
+        let Some(new_pane_view) = self
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .active_session_view(ctx)
+        else {
+            log::warn!(
+                "start_local_to_cloud_handoff: no active session view after add_ambient_agent_pane"
+            );
+            return;
+        };
+
+        let Some(model_handle) = new_pane_view
+            .as_ref(ctx)
+            .ambient_agent_view_model()
+            .cloned()
+        else {
+            log::warn!("start_local_to_cloud_handoff: new ambient agent pane has no view model");
+            return;
+        };
+
+        // `add_ambient_agent_pane` already entered cloud agent view via
+        // `enter_ambient_agent_setup` (which transitions the model into `Composing` /
+        // `Setup`). Pre-fill the prompt input from the slash command argument, if any.
+        if let Some(prompt) = initial_prompt.as_deref().filter(|p| !p.is_empty()) {
+            new_pane_view.update(ctx, |terminal_view, view_ctx| {
+                terminal_view.input().update(view_ctx, |input, input_ctx| {
+                    input.replace_buffer_content(prompt, input_ctx);
+                });
+            });
+        }
+
+        // Fall through to a fresh cloud-mode pane (no handoff context) when there's
+        // nothing meaningful to hand off. The pane was already opened above.
+        let Some((conversation, source_token)) = source else {
+            return;
+        };
+
+        // Seed the handoff context onto the new pane's `AmbientAgentViewModel` so
+        // `is_local_to_cloud_handoff()` is true from this point on (the V2 input
+        // is suppressed and the submit path routes through the orchestrator).
+        let pending = PendingHandoff {
+            source_conversation_id: source_token,
+            touched_workspace: None,
+            submission_state: HandoffSubmissionState::Idle,
+        };
+        model_handle.update(ctx, |model, model_ctx| {
+            model.set_pending_handoff(Some(pending), model_ctx);
+        });
+
+        // Kick off touched-repo derivation off the main thread. The conversation
+        // walk lives inside the spawned future too so we don't pay it on chip click
+        // (long conversations have hundreds of action results to traverse). When
+        // derivation completes, apply the repo-aware overlap pick on top of
+        // whatever `ensure_default_selection` already picked, but only if the pane
+        // is still in handoff mode — the pane could have been closed in the
+        // interim. On a real overlap match we override unconditionally so the
+        // user's last-selected (potentially empty) env doesn't shadow a matching
+        // env; on no-overlap we leave the existing selection alone, since the env
+        // selector's recency-based default is the best fallback.
+        let async_model_handle = model_handle.clone();
+        ctx.spawn(
+            async move {
+                let paths = extract_paths_from_conversation(&conversation);
+                derive_touched_workspace(paths).await
+            },
+            move |_workspace, derived_workspace, ctx| {
+                async_model_handle.update(ctx, |model, model_ctx| {
+                    if !model.is_local_to_cloud_handoff() {
+                        return;
+                    }
+                    let mut envs = CloudAmbientAgentEnvironment::get_all(model_ctx);
+                    sort_environments_by_recency(&mut envs);
+                    if let Some(overlap_env) = pick_handoff_overlap_env(&derived_workspace, envs) {
+                        model.set_environment_id(Some(overlap_env), model_ctx);
+                    }
+                    model.set_pending_handoff_workspace(derived_workspace, model_ctx);
+                });
+            },
+        );
+    }
+
     pub(crate) fn handle_file_tree_event(
         &mut self,
         pane_group: ViewHandle<PaneGroup>,
@@ -13414,6 +13559,42 @@ impl Workspace {
             }
             #[cfg(not(feature = "local_fs"))]
             pane_group::Event::RemoteRepoNavigated { .. } => {}
+            pane_group::Event::OpenChildAgentInNewTab { conversation_id } => {
+                // "Open in new tab" from the orchestration pill bar's 3-dot
+                // menu. Spawn a fresh session tab and enter agent view for
+                // the child conversation. The conversation already lives in
+                // `BlocklistAIHistoryModel`, so the new terminal view can
+                // adopt it without any restoration plumbing — just call
+                // `enter_agent_view_for_conversation` on it.
+                let conversation_id = *conversation_id;
+                let window_id = ctx.window_id();
+                self.add_new_session_tab_with_default_mode(
+                    NewSessionSource::Tab,
+                    Some(window_id),
+                    None, /* chosen_shell */
+                    None, /* conversation_restoration */
+                    true, /* hide_homepage */
+                    ctx,
+                );
+                if let Some(terminal_view) = self
+                    .active_tab_pane_group()
+                    .as_ref(ctx)
+                    .active_session_view(ctx)
+                {
+                    terminal_view.update(ctx, |view, ctx| {
+                        view.enter_agent_view_for_conversation(
+                            None,
+                            AgentViewEntryOrigin::OrchestrationPillBar,
+                            conversation_id,
+                            ctx,
+                        );
+                    });
+                } else {
+                    log::warn!(
+                        "OpenChildAgentInNewTab: no active terminal view in newly created tab"
+                    );
+                }
+            }
             pane_group::Event::DroppedOnTabBar { origin, pane_id } => {
                 if let Some(hovered_tab_index) = self.hovered_tab_index {
                     match hovered_tab_index {
@@ -18285,6 +18466,18 @@ impl Workspace {
                     self.render_config_panel_maximized(pane_group, &config, app),
                     app,
                 );
+            } else if !config.contains_item(&HeaderToolbarItemKind::CodeReview) {
+                Self::add_panel_with_separator(
+                    &mut main_content,
+                    &mut prev_panel_added,
+                    self.render_config_panel(
+                        &HeaderToolbarItemKind::CodeReview,
+                        pane_group,
+                        &config,
+                        app,
+                    ),
+                    app,
+                );
             }
         } else if !is_right_maximized {
             main_content = main_content.with_child(Shrinkable::new(1.0, terminal_content).finish());
@@ -18932,6 +19125,18 @@ impl Workspace {
                     self.render_config_panel_maximized(pane_group, &config, app),
                     app,
                 );
+            } else if !config.contains_item(&HeaderToolbarItemKind::CodeReview) {
+                Self::add_panel_with_separator(
+                    &mut panels_view,
+                    &mut prev_panel_added,
+                    self.render_config_panel(
+                        &HeaderToolbarItemKind::CodeReview,
+                        pane_group,
+                        &config,
+                        app,
+                    ),
+                    app,
+                );
             }
         }
 
@@ -18991,7 +19196,7 @@ impl Workspace {
     }
 
     /// Renders a configurable panel for the given toolbar item, if it is open.
-    /// Returns `None` if the panel should not be rendered (item not available,
+    /// Returns `None` if the panel should not be rendered (item not supported,
     /// panel not open, or item is not a panel type).
     fn render_config_panel(
         &self,
@@ -19000,7 +19205,7 @@ impl Workspace {
         config: &HeaderToolbarChipSelection,
         app: &AppContext,
     ) -> Option<Box<dyn Element>> {
-        if !item.is_available(app) || !item.is_panel() {
+        if !item.is_supported(app) || !item.is_panel() {
             return None;
         }
         match item {
@@ -19046,7 +19251,7 @@ impl Workspace {
         if !pane_group.right_panel_open || !pane_group.is_right_panel_maximized {
             return None;
         }
-        if !HeaderToolbarItemKind::CodeReview.is_available(app) {
+        if !HeaderToolbarItemKind::CodeReview.is_supported(app) {
             return None;
         }
         Some(Shrinkable::new(1.0, ChildView::new(&self.right_panel_view).finish()).finish())
@@ -19996,6 +20201,12 @@ impl TypedActionView for Workspace {
             OpenSettingsFile => {
                 let path = crate::settings::user_preferences_toml_file_path();
                 self.add_tab_for_code_file(path, None, ctx);
+            }
+            OpenLocalToCloudHandoffPane { initial_prompt } => {
+                #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+                self.start_local_to_cloud_handoff(initial_prompt.clone(), ctx);
+                #[cfg(not(all(feature = "local_fs", not(target_family = "wasm"))))]
+                let _ = initial_prompt;
             }
             OpenNetworkLogPane => {
                 self.open_network_log_pane(ctx);
@@ -22277,15 +22488,27 @@ impl View for Workspace {
                 && self.vertical_tabs_panel_open;
 
             if is_vertical {
-                // Anchor the menu below the vertical-tabs + button.
+                // Anchor the menu below the vertical-tabs + button. The anchor
+                // side mirrors which side the tabs panel itself is on, so the
+                // menu always expands inward and stays inside the window.
+                let tabs_side =
+                    Self::tabs_panel_side(&TabSettings::as_ref(app).header_toolbar_chip_selection);
+                let (anchor, child_anchor) = match tabs_side {
+                    PanelPosition::Left => {
+                        (PositionedElementAnchor::BottomLeft, ChildAnchor::TopLeft)
+                    }
+                    PanelPosition::Right => {
+                        (PositionedElementAnchor::BottomRight, ChildAnchor::TopRight)
+                    }
+                };
                 stack.add_positioned_overlay_child(
                     ChildView::new(&self.new_session_dropdown_menu).finish(),
                     OffsetPositioning::offset_from_save_position_element(
                         vertical_tabs::VERTICAL_TABS_ADD_TAB_POSITION_ID,
                         vec2f(0., 4.),
                         PositionedElementOffsetBounds::WindowBySize,
-                        PositionedElementAnchor::BottomLeft,
-                        ChildAnchor::TopLeft,
+                        anchor,
+                        child_anchor,
                     ),
                 );
             } else {
