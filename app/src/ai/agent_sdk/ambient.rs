@@ -417,6 +417,7 @@ impl AmbientAgentRunner {
 
             let harness_override = (args.harness != Harness::Oz).then_some(HarnessConfig {
                 harness_type: args.harness,
+                model_id: None,
             });
             let harness_auth_secrets = args.claude_auth_secret.clone().map(|name| {
                 crate::ai::ambient_agents::task::HarnessAuthSecretsConfig {
@@ -483,13 +484,14 @@ impl AmbientAgentRunner {
                     (_, true) => Some(false),
                     _ => None,
                 },
+                agent_identity_uid: args.agent_uid,
                 skill,
                 attachments,
                 interactive: None,
                 parent_run_id: None,
                 runtime_skills: vec![],
                 referenced_attachments: vec![],
-                fork_from_conversation_id: None,
+                conversation_id: None,
                 initial_snapshot_token: None,
             };
 
