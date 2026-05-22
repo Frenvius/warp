@@ -10,62 +10,56 @@ pub mod referral;
 pub mod team;
 pub mod workspace;
 
+use std::borrow::Cow;
+use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ::http::header::CONTENT_LENGTH;
+use ai::AIClient;
+use anyhow::{anyhow, Context, Result};
+use auth::{AuthClient, AMBIENT_WORKLOAD_TOKEN_HEADER, CLOUD_AGENT_ID_HEADER};
+use base64::prelude::BASE64_URL_SAFE;
+use base64::Engine;
+use block::BlockClient;
+use channel_versions::ChannelVersions;
+use chrono::{DateTime, FixedOffset};
+use futures::StreamExt;
+use instant::Instant;
+use object::ObjectClient;
+use parking_lot::{Mutex, RwLock};
+use prost::Message;
+use referral::ReferralsClient;
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use team::TeamClient;
+use url::Url;
+use warp_core::context_flag::ContextFlag;
+use warp_core::errors::{register_error, AnyhowErrorExt, ErrorExt};
+use warp_core::telemetry::TelemetryEvent;
+use warp_managed_secrets::client::ManagedSecretsClient;
+use warpui::r#async::BoxFuture;
+use warpui::{Entity, ModelContext, SingletonEntity};
+use workspace::WorkspaceClient;
+
+use super::experiments::{ServerExperiment, ServerExperiments};
+use super::graphql::GraphQLError;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::get_relevant_files::api::{GetRelevantFiles, GetRelevantFilesResponse};
-use crate::ai::predict::generate_ai_input_suggestions;
 use crate::ai::predict::generate_ai_input_suggestions::GenerateAIInputSuggestionsRequest;
-use crate::ai::predict::generate_am_query_suggestions;
 use crate::ai::predict::generate_am_query_suggestions::GenerateAMQuerySuggestionsRequest;
 use crate::ai::predict::predict_am_queries::{PredictAMQueriesRequest, PredictAMQueriesResponse};
+use crate::ai::predict::{generate_ai_input_suggestions, generate_am_query_suggestions};
 use crate::ai::voice::transcribe::{TranscribeRequest, TranscribeResponse};
 use crate::auth::auth_manager::AuthManager;
 use crate::auth::auth_state::AuthState;
 use crate::auth::UserUid;
 use crate::server::graphql::default_request_options;
 use crate::server::server_api::presigned_upload::HttpStatusError;
-use ai::AIClient;
-use auth::{AuthClient, AMBIENT_WORKLOAD_TOKEN_HEADER, CLOUD_AGENT_ID_HEADER};
-use base64::prelude::BASE64_URL_SAFE;
-use base64::Engine;
-use block::BlockClient;
-use channel_versions::ChannelVersions;
-use futures::StreamExt;
-use object::ObjectClient;
-use prost::Message;
-use referral::ReferralsClient;
-use team::TeamClient;
-use url::Url;
-use warp_core::context_flag::ContextFlag;
-use warp_core::errors::{register_error, AnyhowErrorExt, ErrorExt};
-use warp_managed_secrets::client::ManagedSecretsClient;
-use warpui::{r#async::BoxFuture, ModelContext};
-use workspace::WorkspaceClient;
-
 use crate::server::telemetry::TelemetryApi;
 use crate::settings::PrivacySettingsSnapshot;
-use crate::settings_view;
-
-use crate::ChannelState;
-
-use ::http::header::CONTENT_LENGTH;
-use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, FixedOffset};
-use instant::Instant;
-use parking_lot::{Mutex, RwLock};
-use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-use std::fmt;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
-use warp_core::telemetry::TelemetryEvent;
-use warpui::Entity;
-use warpui::SingletonEntity;
-
-use super::experiments::ServerExperiment;
-use super::experiments::ServerExperiments;
-use super::graphql::GraphQLError;
+use crate::{settings_view, ChannelState};
 
 pub const FETCH_CHANNEL_VERSIONS_TIMEOUT: std::time::Duration = Duration::from_secs(60);
 
@@ -154,10 +148,18 @@ pub enum DeserializationError {
     Transport(reqwest::Error),
 }
 
+#[derive(Deserialize, Debug)]
+struct OutOfCreditsResponse {
+    #[serde(default, rename = "userDisplayMessage")]
+    user_display_message: Option<String>,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum AIApiError {
     #[error("Request failed due to lack of AI quota.")]
-    QuotaLimit,
+    QuotaLimit {
+        user_display_message: Option<String>,
+    },
 
     #[error("Warp is currently overloaded. Please try again later.")]
     ServerOverloaded,
@@ -187,7 +189,12 @@ pub enum AIApiError {
 
 impl From<http_client::ResponseError> for AIApiError {
     fn from(err: http_client::ResponseError) -> Self {
-        Self::from_response_error(err.source, &err.headers)
+        let http_client::ResponseError {
+            source,
+            headers,
+            body,
+        } = err;
+        Self::from_response_error(source, &headers, body)
     }
 }
 
@@ -206,11 +213,15 @@ impl From<serde_json::Error> for AIApiError {
 impl AIApiError {
     /// Converts a reqwest error to an AIApiError, using response headers to distinguish
     /// between different types of 429 errors.
-    fn from_response_error(err: reqwest::Error, headers: &::http::HeaderMap) -> Self {
+    fn from_response_error(
+        err: reqwest::Error,
+        headers: &::http::HeaderMap,
+        body: Option<String>,
+    ) -> Self {
         // For HTTP 429 errors, check the X-Warp-Error-Code header to distinguish
         // between out-of-credits and server-overload.
         if err.status() == Some(http::StatusCode::TOO_MANY_REQUESTS) {
-            return Self::error_for_429(headers);
+            return Self::error_for_429(headers, body);
         }
 
         Self::from_transport_error(err)
@@ -246,13 +257,18 @@ impl AIApiError {
     }
 
     /// Returns the appropriate error for a 429 response by checking the X-Warp-Error-Code header.
-    fn error_for_429(headers: &::http::HeaderMap) -> Self {
+    fn error_for_429(headers: &::http::HeaderMap, body: Option<String>) -> Self {
         if headers
             .get(WARP_ERROR_CODE_HEADER)
             .and_then(|v| v.to_str().ok())
             == Some(WARP_ERROR_CODE_OUT_OF_CREDITS)
         {
-            AIApiError::QuotaLimit
+            let user_display_message = body
+                .and_then(|body| serde_json::from_str::<OutOfCreditsResponse>(&body).ok())
+                .and_then(|r| r.user_display_message);
+            AIApiError::QuotaLimit {
+                user_display_message,
+            }
         } else {
             AIApiError::ServerOverloaded
         }
@@ -264,8 +280,12 @@ impl AIApiError {
         match err {
             reqwest_eventsource::Error::InvalidStatusCode(
                 http::StatusCode::TOO_MANY_REQUESTS,
-                ref res,
-            ) => Self::error_for_429(res.headers()),
+                res,
+            ) => {
+                let headers = res.headers().clone();
+                let body = res.text().await.ok();
+                Self::error_for_429(&headers, body)
+            }
             reqwest_eventsource::Error::InvalidStatusCode(status, res) => Self::ErrorStatus(
                 status,
                 res.text()
@@ -316,9 +336,9 @@ impl ErrorExt for AIApiError {
             AIApiError::Other(error) => error.is_actionable(),
             AIApiError::Stream { source, .. } => source.is_actionable(),
             AIApiError::ErrorStatus(_, _) => self.is_retryable(),
-            AIApiError::QuotaLimit | AIApiError::ServerOverloaded | AIApiError::NoContextFound => {
-                false
-            }
+            AIApiError::QuotaLimit { .. }
+            | AIApiError::ServerOverloaded
+            | AIApiError::NoContextFound => false,
         }
     }
 }
@@ -872,7 +892,13 @@ impl ServerApi {
             }
         }
         if status == StatusCode::TOO_MANY_REQUESTS && is_out_of_credits {
-            return AIApiError::QuotaLimit.into();
+            let user_display_message = serde_json::from_str::<OutOfCreditsResponse>(&response_text)
+                .ok()
+                .and_then(|r| r.user_display_message);
+            return AIApiError::QuotaLimit {
+                user_display_message,
+            }
+            .into();
         }
 
         // Try to deserialize error response as { "error": "message" }
@@ -1044,7 +1070,8 @@ impl ServerApi {
         .json(request)
         .send()
         .await?
-        .error_for_status()?
+        .error_for_status_with_body()
+        .await?
         .json()
         .await?;
         Ok(response)
@@ -1068,7 +1095,8 @@ impl ServerApi {
         .json(request)
         .send()
         .await?
-        .error_for_status()?
+        .error_for_status_with_body()
+        .await?
         .json()
         .await?;
 
@@ -1105,7 +1133,8 @@ impl ServerApi {
         .json(request)
         .send()
         .await?
-        .error_for_status()?
+        .error_for_status_with_body()
+        .await?
         .json()
         .await?;
         Ok(response)
@@ -1128,7 +1157,8 @@ impl ServerApi {
         .json(request)
         .send()
         .await?
-        .error_for_status()?
+        .error_for_status_with_body()
+        .await?
         .json()
         .await?;
         Ok(response)
@@ -1215,11 +1245,16 @@ impl ServerApi {
             }
         );
 
-        let ambient_workload_token = self
-            .get_or_create_ambient_workload_token()
-            .await
-            .map_err(Into::into)
-            .map_err(Arc::new)?;
+        let ambient_workload_token = if is_passive {
+            // Do not include cloud agent workload metadata in passive suggestion requests - they
+            // read from the main conversation, but cannot modify it.
+            None
+        } else {
+            self.get_or_create_ambient_workload_token()
+                .await
+                .map_err(Into::into)
+                .map_err(Arc::new)?
+        };
 
         let mut request_builder = self
             .client
@@ -1523,13 +1558,14 @@ impl SingletonEntity for ServerApiProvider {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use cynic::{GraphQlError, GraphQlResponse};
-    use futures::executor::block_on;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use cynic::{GraphQlError, GraphQlResponse};
+    use futures::executor::block_on;
+
+    use super::*;
 
     struct FakeGraphqlOperation {
         expected_auth_token: Option<String>,
